@@ -132,6 +132,10 @@ async def _run_analysis(
         "feature_count": result.feature_count,
         "truncated": result.truncated,
     }
+    if distance_meters is not None:
+        # feat(#675): ride the sanitized buffer distance along so the action
+        # collector can hand the preview off to the Analysis panel prefilled.
+        out["distance_meters"] = distance_meters
     if result.feature_count == 0:
         out["note"] = "The operation produced no geometry for this layer."
         return out
@@ -162,13 +166,27 @@ def collect_run_analysis_action(result: dict) -> dict | None:
     actually bit, so EphemeralBadge can say "500 of 10,651 features" instead of
     presenting a capped preview as the complete result.
     """
-    if not (result.get("bbox") and "geojson" in result):
+    if "error" in result:
         return None
+    if not (result.get("bbox") and "geojson" in result):
+        # fix(#676): an empty preview still emits a geometry-less marker so the
+        # frontend clears a stale overlay from an earlier turn — with no action
+        # at all, the previous overlay (and its badge) keeps describing a
+        # result the chat text has moved past.
+        return {"type": "show_query_result", "row_count": 0}
     action = {
         "type": "show_query_result",
         "geojson": result["geojson"],
         "bbox": result["bbox"],
     }
+    # feat(#675): carry the params needed to reconstruct the request so the
+    # builder can offer a one-click "Save as dataset" handoff into the
+    # Analysis panel. The viewer surface ignores them (no Analysis rail).
+    if result.get("operation") and result.get("layer_id"):
+        action["operation"] = result["operation"]
+        action["layer_id"] = result["layer_id"]
+        if result.get("distance_meters") is not None:
+            action["distance_meters"] = result["distance_meters"]
     total = result.get("source_feature_count")
     if result.get("truncated") and total:
         action["truncated"] = True
