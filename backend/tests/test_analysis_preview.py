@@ -745,6 +745,24 @@ class TestBuildPreviewSql:
         # inside the JSON itself.
         assert sql.count("'") == 6
 
+    def test_preview_sql_evaluates_expression_once_per_row(self):
+        """fix(#700 review): the geometry expression lives in a LATERAL
+        subquery (OFFSET 0 blocks pull-up), so the three geom_out references
+        don't triple-evaluate it — while the base table stays a plain FROM
+        item whose pkey index can satisfy ORDER BY and early-terminate at
+        the sandbox row cap."""
+        cases = {
+            "ST_Intersection": AnalysisPreviewRequest(operation="clip", mask=CLIP_MASK),
+            "ST_Buffer": AnalysisPreviewRequest(operation="buffer", distance_meters=10),
+            "ST_Centroid": AnalysisPreviewRequest(operation="centroid"),
+        }
+        for fn, req in cases.items():
+            sql = build_preview_sql('"data"."t1"', req)
+            assert "CROSS JOIN LATERAL (SELECT" in sql
+            assert "OFFSET 0" in sql
+            assert sql.count(fn) == 1
+            assert sql.endswith("ORDER BY gid")
+
     def test_clip_mask_injection_rejected(self):
         req = AnalysisPreviewRequest(
             operation="clip",
