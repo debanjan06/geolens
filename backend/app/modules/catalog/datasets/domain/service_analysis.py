@@ -45,9 +45,16 @@ def build_preview_sql(table_ref: str, request: AnalysisPreviewRequest) -> str:
         distance_meters=request.distance_meters,
         mask=request.mask,
     )
+    # fix(#680 review): drop NULL/EMPTY results in SQL, not in Python — the
+    # sandbox applies its row cap to raw rows, so boundary-grazing clips
+    # (which pass ST_Intersects but extract to EMPTY) could consume the whole
+    # preview budget along a shared boundary and hide real intersections with
+    # higher gids, even reporting a false "no features".
     return (
-        f"SELECT gid, ST_AsGeoJSON({expr}, {_GEOJSON_PRECISION}) AS geometry_json"
-        f" FROM {table_ref}{where} ORDER BY gid"
+        f"SELECT gid, ST_AsGeoJSON(geom_out, {_GEOJSON_PRECISION}) AS geometry_json"
+        f" FROM (SELECT gid, {expr} AS geom_out FROM {table_ref}{where}) AS _op"
+        f" WHERE geom_out IS NOT NULL AND NOT ST_IsEmpty(geom_out)"
+        f" ORDER BY gid"
     )
 
 
@@ -107,4 +114,10 @@ async def run_analysis_preview(
         feature_count=len(features),
         truncated=result.truncated,
         bbox=bbox,
+        # buffer/centroid are 1:1 per feature, so the source count IS the
+        # output total and lets clients render "500 of N" on truncation.
+        # clip filters rows, so its total is unknowable without a second scan.
+        source_feature_count=(
+            dataset.feature_count if request.operation != "clip" else None
+        ),
     )
