@@ -19,7 +19,7 @@ from app.platform.jobs.models import IngestJob
 from app.processing.analysis.tasks import _materialize
 
 from tests.factories import get_user_id
-from tests.test_analysis_preview import _create_polygon_dataset
+from tests.test_analysis_preview import _create_mask_dataset, _create_polygon_dataset
 
 
 def _materialize_url(dataset_id) -> str:
@@ -75,6 +75,181 @@ class TestMaterializeEndpoint:
         job = await test_db_session.get(IngestJob, uuid.UUID(data["job_id"]))
         assert job is not None
         assert job.status == "pending"
+        # Request params ride the job row so Admin → Jobs can diagnose runs.
+        meta = (job.user_metadata or {}).get("analysis", {})
+        assert meta["operation"] == "buffer"
+        assert meta["distance_meters"] == 100
+        assert meta["source_dataset_id"] == str(ds.id)
+        assert "mask" not in meta
+        # Release the per-user active-job slot for later tests (shared DB).
+        job.status = "failed"
+        await test_db_session.commit()
+
+    async def test_second_materialize_while_active_is_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """One materialize per user at a time: a second request while a job is
+        still pending/running 429s instead of stacking CTAS work; a finished
+        job releases the slot."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        with patch.object(router_analysis, "defer_async_with_tenant", AsyncMock()):
+            first = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "First"},
+                headers=admin_auth_header,
+            )
+            assert first.status_code == 200, first.text
+            second = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Second"},
+                headers=admin_auth_header,
+            )
+            assert second.status_code == 429
+            job = await test_db_session.get(
+                IngestJob, uuid.UUID(first.json()["job_id"])
+            )
+            job.status = "failed"
+            await test_db_session.commit()
+            third = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Third"},
+                headers=admin_auth_header,
+            )
+            assert third.status_code == 200, third.text
+            # Release the slot for later tests (shared DB).
+            third_job = await test_db_session.get(
+                IngestJob, uuid.UUID(third.json()["job_id"])
+            )
+            third_job.status = "failed"
+            await test_db_session.commit()
+
+    async def test_upload_named_like_an_analysis_job_does_not_block(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """fix(#682 review): the active-job check keys on the analysis marker
+        in user_metadata, not source_filename — that column holds the user's
+        own upload filename, so uploading "analysis-data.geojson" must not
+        lock them out of analysis."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        upload = await _create_job(test_db_session, admin_id)
+        upload.source_filename = "analysis-data.geojson"
+        upload.status = "running"
+        upload.user_metadata = None
+        await test_db_session.commit()
+
+        with patch.object(router_analysis, "defer_async_with_tenant", AsyncMock()):
+            resp = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Not blocked"},
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200, resp.text
+        job = await test_db_session.get(IngestJob, uuid.UUID(resp.json()["job_id"]))
+        job.status = "failed"
+        upload.status = "failed"
+        await test_db_session.commit()
+
+    async def test_old_pending_job_still_blocks(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """A pending job is queued work that will still run, so a backlogged
+        ingest queue must not let a second CTAS through however old it is."""
+        from datetime import datetime, timedelta, timezone
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        backlogged = await _create_job(test_db_session, admin_id)
+        backlogged.user_metadata = {"analysis": {"operation": "buffer"}}
+        backlogged.created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        await test_db_session.commit()
+
+        with patch.object(router_analysis, "defer_async_with_tenant", AsyncMock()):
+            resp = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Should be blocked"},
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 429, resp.text
+        backlogged.status = "failed"
+        await test_db_session.commit()
+
+    async def test_backlogged_job_that_just_started_still_blocks(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """A job that waited out a queue backlog and only just began is fully
+        active, so enqueue age must not exclude it from the cap."""
+        from datetime import datetime, timedelta, timezone
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        backlogged = await _create_job(test_db_session, admin_id)
+        backlogged.user_metadata = {"analysis": {"operation": "buffer"}}
+        backlogged.status = "running"
+        backlogged.created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        backlogged.started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await test_db_session.commit()
+
+        with patch.object(router_analysis, "defer_async_with_tenant", AsyncMock()):
+            resp = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Should be blocked"},
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 429, resp.text
+        backlogged.status = "failed"
+        await test_db_session.commit()
+
+    async def test_long_running_job_still_blocks(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """fix(#682 review): elapsed time is NOT a liveness signal, so an old
+        'running' job keeps the slot.
+
+        The 300s statement_timeout bounds each statement, not the job — a
+        materialize runs a CTAS, a DELETE, an EXISTS probe, two ALTERs, a
+        primary key, add_4326_column and registration in sequence, so a
+        legitimate run over a large dataset can outlive any window short
+        enough to be useful. Releasing the slot on age would let a second
+        expensive CTAS through and defeat the cap. A worker that truly died
+        is resolved by the platform job timeout instead (see #691).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        long_running = await _create_job(test_db_session, admin_id)
+        long_running.status = "running"
+        long_running.user_metadata = {"analysis": {"operation": "buffer"}}
+        long_running.started_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        long_running.created_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        await test_db_session.commit()
+
+        with patch.object(router_analysis, "defer_async_with_tenant", AsyncMock()):
+            resp = await client.post(
+                _materialize_url(ds.id),
+                json={"operation": "centroid", "title": "Should be blocked"},
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 429, resp.text
+        long_running.status = "failed"
+        await test_db_session.commit()
 
     async def test_materialize_private_source_hidden(
         self,
@@ -176,6 +351,10 @@ class TestMaterializeEndpoint:
                 headers=admin_auth_header,
             )
         assert resp.status_code == 200, resp.text
+        # Release the per-user active-job slot for later tests (shared DB).
+        job = await test_db_session.get(IngestJob, uuid.UUID(resp.json()["job_id"]))
+        job.status = "failed"
+        await test_db_session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +384,17 @@ class TestMaterializeWorker:
         await test_db_session.refresh(job)
         assert job.status == "complete", job.error_message
         assert job.dataset_id is not None
+        # fix(#682 review): without started_at the row carries no liveness
+        # signal, so the platform's stale-job sweep (which matches on
+        # coalesce(heartbeat_at, started_at)) could never recover a crashed
+        # analysis job.
+        assert job.started_at is not None
+        # ...and started_at ALONE would condemn a job that legitimately outlives
+        # JOB_TIMEOUT_SECONDS, since the same coalesce would then read as stale
+        # while the work is still running. The lease the worker takes is what
+        # keeps a live job out of the sweep, so pin that it exists.
+        assert job.attempt_id is not None
+        assert job.heartbeat_at is not None
 
         from app.modules.catalog.datasets.domain.models import Dataset
 
@@ -398,6 +588,8 @@ class TestMaterializeWorker:
         test_db_session: AsyncSession,
     ):
         """A clip matching nothing must fail loud, not register a junk dataset."""
+        from app.processing.analysis.tasks import ANALYSIS_JOBS
+
         admin_id = await get_user_id(test_db_session, "admin")
         ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
         job = await _create_job(test_db_session, admin_id)
@@ -405,6 +597,9 @@ class TestMaterializeWorker:
             "type": "Polygon",
             "coordinates": [[[50, 50], [51, 50], [51, 51], [50, 51], [50, 50]]],
         }
+        failed_before = ANALYSIS_JOBS.labels(
+            operation="clip", status="failed"
+        )._value.get()
 
         await _materialize(
             job_id=str(job.id),
@@ -419,6 +614,10 @@ class TestMaterializeWorker:
         assert job.status == "failed"
         assert "no features" in (job.error_message or "")
         assert job.dataset_id is None
+        assert (
+            ANALYSIS_JOBS.labels(operation="clip", status="failed")._value.get()
+            == failed_before + 1
+        )
 
     async def test_name_collision_preserves_existing_table(
         self,
@@ -470,6 +669,68 @@ class TestMaterializeWorker:
             .all()
         )
         assert cols == ["marker"]
+
+    async def test_clip_by_layer_materialize(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """Worker resolves the mask dataset's table and clips against its
+        unioned geometries — same output as an equivalent drawn mask."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        mask_ds = await _create_mask_dataset(
+            test_db_session,
+            created_by=admin_id,
+            wkt="POLYGON((-0.5 -0.5, -0.5 0.5, 0.5 0.5, 0.5 -0.5, -0.5 -0.5))",
+        )
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(ds.id),
+            user_id=str(admin_id),
+            operation="clip",
+            title=f"Layer clipped {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(mask_ds.id),
+        )
+
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        new_ds = await test_db_session.get(Dataset, job.dataset_id)
+        assert new_ds is not None
+        rows = (
+            await test_db_session.execute(
+                text(
+                    f"SELECT name, GeometryType(geom_4326) FROM data.{new_ds.table_name}"  # noqa: S608
+                )
+            )
+        ).all()
+        assert rows == [("a", "POLYGON")]
+
+    async def test_clip_by_layer_missing_mask_fails_job(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """A mask dataset deleted between enqueue and run fails cleanly."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(ds.id),
+            user_id=str(admin_id),
+            operation="clip",
+            title="Ghost mask",
+            mask_dataset_id=str(uuid.uuid4()),
+        )
+
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+        assert "Mask dataset not found" in (job.error_message or "")
 
     async def test_mixed_geometry_dissolve_stays_typed(
         self,

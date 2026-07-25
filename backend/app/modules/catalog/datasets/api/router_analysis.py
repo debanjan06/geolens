@@ -4,6 +4,7 @@ import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.tenant_session import defer_async_with_tenant
@@ -28,6 +29,7 @@ from app.platform.jobs.defer_guard import (
     defer_with_orphan_guard,
     make_ingest_job_failed_rollback,
 )
+from app.platform.jobs.models import IngestJob
 from app.platform.sandbox.schemas import SandboxError
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
@@ -67,6 +69,24 @@ async def _load_vector_dataset(db: AsyncSession, dataset_id: uuid.UUID, user: Id
     return dataset
 
 
+_POLYGONAL_TYPES = {"POLYGON", "MULTIPOLYGON"}
+
+
+async def _load_mask_dataset(
+    db: AsyncSession, mask_dataset_id: uuid.UUID, user: Identity
+):
+    """Fetch + visibility-check a clip-mask dataset (Rule 1 applies to BOTH
+    datasets of a two-layer operation) and require it to be polygonal —
+    unioning points/lines produces a mask that clips nothing meaningful."""
+    dataset = await _load_vector_dataset(db, mask_dataset_id, user)
+    if (dataset.geometry_type or "").upper() not in _POLYGONAL_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="mask_dataset_id must reference a polygon dataset",
+        )
+    return dataset
+
+
 @router.post("/{dataset_id}/analysis/preview/", response_model=AnalysisPreviewResponse)
 async def analysis_preview_endpoint(
     dataset_id: uuid.UUID,
@@ -80,8 +100,15 @@ async def analysis_preview_endpoint(
     persistence — use the materialize endpoint to save output as a dataset.
     """
     dataset = await _load_vector_dataset(db, dataset_id, user)
+    mask_dataset = (
+        await _load_mask_dataset(db, body.mask_dataset_id, user)
+        if body.mask_dataset_id is not None
+        else None
+    )
     try:
-        return await run_analysis_preview(db, dataset, body, user.id)
+        return await run_analysis_preview(
+            db, dataset, body, user.id, mask_dataset=mask_dataset
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -116,7 +143,11 @@ async def analysis_materialize_endpoint(
     dataset = await _load_vector_dataset(db, dataset_id, user)
 
     # Fail fast on invalid params before creating a job.
-    if body.operation == "clip":
+    if body.operation == "clip" and body.mask_dataset_id is not None:
+        # Access + polygon checks happen here at enqueue time; the worker
+        # re-resolves the table name and re-validates it against _SAFE_TABLE.
+        await _load_mask_dataset(db, body.mask_dataset_id, user)
+    elif body.operation == "clip":
         try:
             render_mask_expr(body.mask or {})
         except ValueError as exc:
@@ -146,9 +177,65 @@ async def analysis_materialize_endpoint(
     # reservation happens at registration time in the worker.
     await check_upload_quota(db, user.id, 0, request)
 
+    # One materialize at a time per user: each queued job is an unbounded-ish
+    # CTAS, so without a cap one user can stack N of them. ponytail: soft cap —
+    # a TOCTOU race can briefly admit two; add a DB-side partial unique index if
+    # operators need a hard guarantee.
+    #
+    # Any pending-or-running job blocks, with NO staleness window (fix(#682
+    # review)). A window looks appealing — it would stop a worker that died
+    # mid-job from holding the slot — but there is no liveness signal here to
+    # base one on, and elapsed time is not a substitute: the 300s
+    # statement_timeout bounds each STATEMENT, while the task runs a CTAS, a
+    # DELETE, an EXISTS probe, two ALTERs, a primary key, add_4326_column and
+    # registration in sequence. A legitimate materialize over a large dataset
+    # can outlive any window short enough to be useful, and releasing the slot
+    # then lets a second expensive CTAS through — defeating the cap outright.
+    # The cost of not having one is bounded and visible: a dead worker holds
+    # the slot until the platform's job timeout fails the row (started_at is
+    # stamped, so that path works), and the client applies this same rule, so
+    # the UI never disagrees with the API about whether a job is active.
+    # Proper fix is a heartbeat lease (issue #691), as the ingest tasks use.
+    active = await db.scalar(
+        select(func.count())
+        .select_from(IngestJob)
+        .where(
+            IngestJob.created_by == user.id,
+            # fix(#682 review): the analysis marker in user_metadata, NOT
+            # source_filename — uploads copy the user's own filename into that
+            # column, so an upload named "analysis-data.geojson" would lock the
+            # uploader out of analysis. The metadata below is written in the
+            # same transaction as the job row, so this never misses one.
+            IngestJob.user_metadata.has_key("analysis"),
+            IngestJob.status.in_(("pending", "running")),
+        )
+    )
+    if active:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="An analysis job is already running; wait for it to finish",
+        )
+
     job = await get_catalog_port().create_ingest_job(
         db, f"analysis-{body.operation}", "", user.id
     )
+    # Record the request params so Admin → Jobs can diagnose a failed run
+    # ("analysis-buffer failed" alone says nothing). The drawn mask geometry
+    # is deliberately NOT stored — it can be kilobytes; a marker suffices.
+    analysis_meta = {
+        "operation": body.operation,
+        "source_dataset_id": str(dataset.id),
+        "title": body.title,
+    }
+    if body.distance_meters is not None:
+        analysis_meta["distance_meters"] = body.distance_meters
+    if body.by_field is not None:
+        analysis_meta["by_field"] = body.by_field
+    if body.operation == "clip":
+        analysis_meta["mask_source"] = "layer" if body.mask_dataset_id else "drawn"
+        if body.mask_dataset_id is not None:
+            analysis_meta["mask_dataset_id"] = str(body.mask_dataset_id)
+    job.user_metadata = {"analysis": analysis_meta}
     await db.commit()
 
     rollback = make_ingest_job_failed_rollback(
@@ -156,6 +243,15 @@ async def analysis_materialize_endpoint(
     )
 
     async def _defer() -> None:
+        # mask_dataset_id rides along only when set: a worker still running
+        # the pre-clip-by-layer code rejects unknown kwargs, and an
+        # unconditional None would break EVERY materialize during a rolling
+        # deploy instead of only the new feature.
+        extra_kwargs = (
+            {"mask_dataset_id": str(body.mask_dataset_id)}
+            if body.mask_dataset_id is not None
+            else {}
+        )
         await defer_async_with_tenant(
             get_catalog_port().materialize_analysis_task(),
             job_id=str(job.id),
@@ -166,6 +262,7 @@ async def analysis_materialize_endpoint(
             distance_meters=body.distance_meters,
             mask=body.mask,
             by_field=body.by_field,
+            **extra_kwargs,
         )
 
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db)

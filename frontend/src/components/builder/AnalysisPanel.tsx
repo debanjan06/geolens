@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@tanstack/react-query';
 import { TerraDraw, TerraDrawPolygonMode } from 'terra-draw';
 import { TerraDrawMapLibreGLAdapter } from 'terra-draw-maplibre-gl-adapter';
 import type { Map as MaplibreMap } from 'maplibre-gl';
@@ -16,17 +16,18 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { MAP_COLORS } from '@/lib/map-colors';
-import { queryKeys } from '@/lib/query-keys';
 import { materializeAnalysis, previewAnalysis } from '@/api/analysis';
 import { useDataset } from '@/components/dataset/hooks/use-dataset';
 import { useJobStatus } from '@/components/import/hooks/use-ingest';
+import { useAnalysisJobStore } from '@/stores/analysis-job-store';
 import type { LayerActions } from '@/components/builder/ChatPanel';
 import type { EphemeralAnalysisHandoff } from '@/components/builder/hooks/use-ephemeral-layers';
 import type { AnalysisOperation, MapLayerResponse } from '@/types/api';
 
 const MAX_BUFFER_METERS = 100_000;
-// shadcn Select items can't carry an empty value — sentinel for "no grouping".
+// shadcn Select items can't carry an empty value — sentinels for "none".
 const BY_FIELD_NONE = '__none__';
+const MASK_LAYER_NONE = '__none__';
 
 interface AnalysisPanelProps {
   layers: MapLayerResponse[];
@@ -43,6 +44,10 @@ interface AnalysisPanelProps {
    *  preview ("Save as dataset"). Applied on mount only — BuilderRail keys the
    *  panel on the handoff so a new one remounts it. */
   prefill?: EphemeralAnalysisHandoff;
+  /** Notifies the app-level watcher of materialize-job changes so
+   *  completion/failure still reports after this panel unmounts. The title
+   *  rides along so a notification arriving minutes later has context. */
+  onAnalysisJobChange?: (jobId: string | null, title?: string) => void;
 }
 
 /**
@@ -58,6 +63,7 @@ export function AnalysisPanel({
   hasPreview,
   layerActions,
   prefill,
+  onAnalysisJobChange,
 }: AnalysisPanelProps) {
   const { t, i18n } = useTranslation('builder');
   const firstEligibleId =
@@ -75,6 +81,8 @@ export function AnalysisPanel({
   );
   const [mask, setMask] = useState<GeoJSON.Polygon | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
+  // Layer-sourced clip mask; mutually exclusive with a drawn mask.
+  const [maskLayerId, setMaskLayerId] = useState(MASK_LAYER_NONE);
   const [byField, setByField] = useState(BY_FIELD_NONE);
   // A chat handoff lands on the save form — suggest a title so its primary
   // button isn't silently disabled for want of one.
@@ -85,16 +93,31 @@ export function AnalysisPanel({
     const opLabel =
       prefill.operation === 'buffer'
         ? t('analysisTools.opBuffer', { defaultValue: 'Buffer' })
-        : t('analysisTools.opCentroid', { defaultValue: 'Centroids' });
+        : prefill.operation === 'centroid'
+          ? t('analysisTools.opCentroid', { defaultValue: 'Centroids' })
+          : prefill.operation === 'clip'
+            ? t('analysisTools.opClip', { defaultValue: 'Clip' })
+            : t('analysisTools.opDissolve', { defaultValue: 'Dissolve' });
     return [base, opLabel].filter(Boolean).join(' — ');
   });
   const [jobId, setJobId] = useState<string | null>(null);
   const drawRef = useRef<TerraDraw | null>(null);
+  // Shares its TanStack query with the page-level tracker (same key), so
+  // there is exactly one 2s poll loop however many components watch the job.
   const job = useJobStatus(jobId).data;
-  const queryClient = useQueryClient();
+  // AnalysisJobWatcher clears this on any terminal status, so a tracked job
+  // is by definition still in flight.
+  const analysisJobRunning = useAnalysisJobStore((s) => !!s.job);
 
   const datasetLayers = layers.filter((l) => !!l.dataset_id && !l.is_dem);
   const selectedLayer = datasetLayers.find((l) => l.id === layerId);
+  // Candidate clip-mask layers: any other dataset layer (the server rejects
+  // non-polygon mask datasets with a clear 422).
+  const maskLayerOptions = datasetLayers.filter((l) => l.id !== layerId);
+  const maskLayer =
+    maskLayerId !== MASK_LAYER_NONE
+      ? maskLayerOptions.find((l) => l.id === maskLayerId)
+      : undefined;
   // Only fetched while dissolve is selected (enabled gates on a non-empty id).
   const datasetDetail = useDataset(
     operation === 'dissolve' ? (selectedLayer?.dataset_id ?? '') : '',
@@ -103,16 +126,6 @@ export function AnalysisPanel({
     .map((c) => c.name)
     // The dissolve output already emits a generated source_count column.
     .filter((name) => name !== 'source_count');
-
-  // fix(#438)-style gap: the materialized dataset was missing from Add-data
-  // search until the stale queries refetched on their own.
-  const jobStatus = job?.status;
-  useEffect(() => {
-    if (jobStatus === 'complete') {
-      queryClient.invalidateQueries({ queryKey: queryKeys.datasets.all });
-      queryClient.invalidateQueries({ queryKey: queryKeys.search.all });
-    }
-  }, [jobStatus, queryClient]);
 
   const stopDrawing = useCallback(() => {
     drawRef.current?.stop();
@@ -126,6 +139,8 @@ export function AnalysisPanel({
   const startDrawing = useCallback(() => {
     const map = mapInstanceRef?.current;
     if (!map || drawRef.current) return;
+    // Drawing replaces a layer-sourced mask.
+    setMaskLayerId(MASK_LAYER_NONE);
     // Direct TerraDraw instantiation (BboxMapPicker precedent) — the feature
     // editing drawing-store is dataset-edit-specific and not reused here.
     const td = new TerraDraw({
@@ -177,6 +192,9 @@ export function AnalysisPanel({
         operation: operation as Exclude<AnalysisOperation, 'dissolve'>,
         ...(operation === 'buffer' ? { distance_meters: distanceValue } : {}),
         ...(operation === 'clip' && mask ? { mask } : {}),
+        ...(operation === 'clip' && !mask && maskLayer?.dataset_id
+          ? { mask_dataset_id: maskLayer.dataset_id }
+          : {}),
       });
     },
     onSuccess: (result) => {
@@ -206,7 +224,11 @@ export function AnalysisPanel({
         toast.info(
           total != null
             ? t('analysisTools.truncatedNoticeTotal', {
-                defaultValue: 'Showing the first {{count}} of {{total}} features',
+                // fix(#680 review): "source features" — the total is the
+                // source dataset's COUNT(*), which can exceed the number of
+                // rows that produce output (NULL/EMPTY geometries).
+                defaultValue:
+                  'Showing the first {{count}} of {{total}} source features',
                 count: result.feature_count,
                 total: total.toLocaleString(i18n.language),
               })
@@ -229,15 +251,25 @@ export function AnalysisPanel({
     mutationFn: async () => {
       const datasetId = selectedLayer?.dataset_id;
       if (!datasetId) throw new Error('No layer selected');
-      return materializeAnalysis(datasetId, {
+      const title = outputTitle.trim();
+      const result = await materializeAnalysis(datasetId, {
         operation,
-        title: outputTitle.trim(),
+        title,
         ...(operation === 'buffer' ? { distance_meters: distanceValue } : {}),
         ...(operation === 'clip' && mask ? { mask } : {}),
+        ...(operation === 'clip' && !mask && maskLayer?.dataset_id
+          ? { mask_dataset_id: maskLayer.dataset_id }
+          : {}),
         ...(operation === 'dissolve' && byField !== BY_FIELD_NONE
-          ? { by_field: byField }
+          ? { by_field: byField.replace(/^col:/, '') }
           : {}),
       });
+      // Notify the page from inside the mutationFn, NOT onSuccess: TanStack
+      // suppresses observer callbacks once the component unmounts, and the
+      // whole point of page-level tracking is surviving an unmount while the
+      // request is in flight.
+      onAnalysisJobChange?.(result.job_id, title);
+      return result;
     },
     onSuccess: (result) => setJobId(result.job_id),
     onError: (error: Error) => {
@@ -250,7 +282,7 @@ export function AnalysisPanel({
 
   const paramsValid =
     (operation !== 'buffer' || distanceValid) &&
-    (operation !== 'clip' || !!mask);
+    (operation !== 'clip' || !!mask || !!maskLayer);
   const canRun =
     !!selectedLayer?.dataset_id &&
     !previewMutation.isPending &&
@@ -259,6 +291,9 @@ export function AnalysisPanel({
   const canSave =
     !!selectedLayer?.dataset_id &&
     !materializeMutation.isPending &&
+    // The API allows one active analysis job per user; reflect that instead of
+    // letting the click earn a 429.
+    !analysisJobRunning &&
     paramsValid &&
     outputTitle.trim().length > 0;
 
@@ -283,8 +318,10 @@ export function AnalysisPanel({
         </Label>
         <Select
           value={layerId}
-          onValueChange={(id) => {
-            setLayerId(id);
+          onValueChange={(v) => {
+            setLayerId(v);
+            // A mask layer can't clip itself.
+            if (v === maskLayerId) setMaskLayerId(MASK_LAYER_NONE);
             // fix(#680): a group-by column chosen for one dataset must not
             // carry to another — it may not exist there (422 from the API) or
             // silently group by a same-named field.
@@ -348,7 +385,7 @@ export function AnalysisPanel({
           <p className="text-xs text-muted-foreground">
             {t('analysisTools.dissolveHint', {
               defaultValue:
-                'Dissolve merges features into one geometry per group; run it with Create dataset',
+                'Dissolve merges features into one geometry per group; only the group field is carried over. Run it with Create dataset',
             })}
           </p>
         )}
@@ -372,7 +409,9 @@ export function AnalysisPanel({
                 })}
               </SelectItem>
               {byFieldColumns.map((name) => (
-                <SelectItem key={name} value={name}>
+                // fix(#680 review): 'col:' prefix keeps a real column named
+                // '__none__' from colliding with the no-grouping sentinel.
+                <SelectItem key={name} value={`col:${name}`}>
                   {name}
                 </SelectItem>
               ))}
@@ -401,7 +440,7 @@ export function AnalysisPanel({
         </div>
       )}
 
-      {operation === 'clip' && (
+      {operation === 'clip' && maskLayer == null && (
         <div className="space-y-1.5">
           {/* Exactly one of the three buttons below renders at a time, so
               they can share the id this label points at. */}
@@ -457,6 +496,43 @@ export function AnalysisPanel({
         </div>
       )}
 
+      {operation === 'clip' && (
+        <div className="space-y-1.5">
+          <Label className="text-xs" htmlFor="analysis-mask-layer">
+            {t('analysisTools.clipLayerLabel', {
+              defaultValue: 'Or clip to a layer',
+            })}
+          </Label>
+          <Select
+            value={maskLayerId}
+            onValueChange={(v) => {
+              setMaskLayerId(v);
+              if (v !== MASK_LAYER_NONE) {
+                // A layer mask replaces a drawn one.
+                setMask(null);
+                stopDrawing();
+              }
+            }}
+          >
+            <SelectTrigger id="analysis-mask-layer" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={MASK_LAYER_NONE}>
+                {t('analysisTools.clipLayerNone', {
+                  defaultValue: 'None — draw on the map',
+                })}
+              </SelectItem>
+              {maskLayerOptions.map((l) => (
+                <SelectItem key={l.id} value={l.id}>
+                  {l.display_name ?? l.dataset_name ?? l.id}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
       <div className="mt-auto flex flex-col gap-2 pt-1">
         {operation !== 'dissolve' && (
           <Button onClick={() => previewMutation.mutate()} disabled={!canRun}>
@@ -489,6 +565,11 @@ export function AnalysisPanel({
             variant="secondary"
             className="w-full"
             onClick={() => {
+              // fix(#682 review): reset only this panel's local status line.
+              // Clearing the GLOBAL tracking here would orphan a job that is
+              // still running (the server then 429s the replacement), losing
+              // the original job's completion notification for good — the
+              // mutation replaces the tracked job on success instead.
               setJobId(null);
               materializeMutation.mutate();
             }}
@@ -504,7 +585,13 @@ export function AnalysisPanel({
                 ? `${t('analysisTools.jobFailed', { defaultValue: 'Analysis job failed' })}${job.error_message ? `: ${job.error_message}` : ''}`
                 : job.status === 'complete'
                   ? t('analysisTools.jobComplete', { defaultValue: 'Dataset created' })
-                  : t('analysisTools.jobRunning', { defaultValue: 'Creating dataset…' })}
+                  : job.current_step === 'registering'
+                    ? t('analysisTools.jobSaving', {
+                        defaultValue: 'Saving the dataset…',
+                      })
+                    : t('analysisTools.jobRunning', {
+                        defaultValue: 'Creating dataset…',
+                      })}
             </p>
           )}
           {job?.status === 'complete' && !!job.dataset_id && layerActions && (

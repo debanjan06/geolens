@@ -5410,6 +5410,11 @@ export interface components {
                 [key: string]: unknown;
             } | null;
             /**
+             * Mask Dataset Id
+             * @description Polygon dataset whose unioned features form the clip mask (clip only; alternative to mask)
+             */
+            mask_dataset_id?: string | null;
+            /**
              * Operation
              * @enum {string}
              */
@@ -5450,6 +5455,11 @@ export interface components {
             mask?: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Mask Dataset Id
+             * @description Polygon dataset whose unioned features form the clip mask (clip only; alternative to mask)
+             */
+            mask_dataset_id?: string | null;
             /**
              * Operation
              * @enum {string}
@@ -8232,7 +8242,7 @@ export interface components {
              */
             created_at: string;
             /** Current Step */
-            current_step?: ("validating" | "ogr2ogr" | "finalize" | "complete" | "cog_convert" | "quicklook") | null;
+            current_step?: ("validating" | "ogr2ogr" | "finalize" | "complete" | "cog_convert" | "quicklook" | "analyzing" | "registering") | null;
             /** Dataset Id */
             dataset_id: string | null;
             /** Error Message */

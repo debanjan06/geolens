@@ -105,6 +105,7 @@ import { usePluginStore } from '@/stores/map-plugin-store';
 import type { ViewportContext } from '@/components/builder/chat-suggestions';
 import type { EphemeralAnalysisHandoff } from '@/components/builder/hooks/use-ephemeral-layers';
 import { readStorage, removeStorage, storageKeys } from '@/lib/storage';
+import { analysisAddToMap, useAnalysisJobStore } from '@/stores/analysis-job-store';
 import { takeChatResult } from '@/lib/chat-result-handoff';
 
 export function MapBuilderPage() {
@@ -779,6 +780,29 @@ export function MapBuilderPage() {
       .map((l) => ({ id: l.id, name: l.display_name ?? l.dataset_name ?? 'Group' }));
   }, [layers.localLayers]);
 
+  // Analysis materialize jobs are tracked globally (AnalysisJobWatcher in
+  // RootLayout owns polling, the completion toast, and cache invalidation) so
+  // the signal survives this page unmounting. This page contributes only the
+  // "Add to map" capability, which needs its layer actions.
+  const setAnalysisJob = useAnalysisJobStore((s) => s.setJob);
+  const handleAnalysisJobChange = useCallback(
+    (jobId: string | null, title?: string) => {
+      setAnalysisJob(jobId ? { jobId, title: title ?? '', mapId: id ?? null } : null);
+    },
+    [setAnalysisJob, id],
+  );
+  // No dep array: keeps the registered callback fresh on every render; the
+  // cleanup is what matters, so the watcher falls back to "View dataset" once
+  // this builder is gone.
+  useEffect(() => {
+    analysisAddToMap.current = layers.chatLayerActions?.onAddDataset ?? null;
+    analysisAddToMap.mapId = id ?? null;
+    return () => {
+      analysisAddToMap.current = null;
+      analysisAddToMap.mapId = null;
+    };
+  });
+
   // feat(#675): "Save as dataset" on the ephemeral badge — open the Analysis
   // panel prefilled with the operation behind the chat preview.
   const ephemeralAnalysis = layers.ephemeralResult?.analysis;
@@ -810,9 +834,11 @@ export function MapBuilderPage() {
     onClearPreview: layers.handleDismissEphemeral,
     hasPreview: !!layers.ephemeralResult,
     analysisPrefill,
+    // setState identity is stable — safe to pass without a memo dep.
+    onAnalysisJobChange: handleAnalysisJobChange,
     onMarkDirty: handleMarkDirty,
     viewport,
-  }), [railPanel, aiAvailable, dockNotes, id, layers.localLayers, layers.chatLayerActions, layers.handleQueryResult, layers.handleDismissEphemeral, layers.ephemeralResult, analysisPrefill, mapInstanceRef, handleMarkDirty, viewport]);
+  }), [railPanel, aiAvailable, dockNotes, id, layers.localLayers, layers.chatLayerActions, layers.handleQueryResult, layers.handleDismissEphemeral, layers.ephemeralResult, analysisPrefill, mapInstanceRef, handleMarkDirty, viewport, handleAnalysisJobChange]);
 
   const mobileRailButtons = useMemo(() => [
     {
